@@ -1,0 +1,483 @@
+# A program to predict the best forex or cryptocurrency pair to trade using machine learning and show the charts on Telegram bot and Flask web app
+
+# Section 1: Import the required libraries and load the environment variables from the .env file
+import os # For accessing environment variables
+import gzip # For compressing and decompressing files
+import pandas as pd # For data manipulation and analysis
+import numpy as np # For scientific computing
+import torch # For deep learning
+from torch import nn # For neural network layers
+from torch.optim import Adam # For optimization algorithm
+from torch.optim.lr_scheduler import ReduceLROnPlateau # For reducing the learning rate when the performance plateaus
+import yfinance as yf # For getting online cryptocurrency data
+import ccxt # For getting online forex data
+from dotenv import load_dotenv # For loading environment variables from .env file
+import bokeh # For creating interactive charts
+import telegram # For creating a Telegram bot
+from flask import Flask, render_template # For creating a Flask web app
+from ta import add_trend_ta, add_volatility_ta, add_momentum_ta, add_others_ta # For adding technical analysis features to the data
+
+# Load the environment variables from the .env file
+load_dotenv()
+
+# Get the parameters from the environment variables using os.getenv method
+DATA_SYMBOLS = os.getenv("DATA_SYMBOLS").split(",") # The list of symbols of the currency or cryptocurrency pairs
+RISK_FREE_RATE = float(os.getenv("RISK_FREE_RATE")) # The risk-free rate of return
+BOT_TOKEN = os.getenv("BOT_TOKEN") # The Telegram bot token
+BOT_CHAT_ID = os.getenv("BOT_CHAT_ID") # The Telegram bot chat id
+DIGITAL_CURRENCY = bool(os.getenv("DIGITAL_CURRENCY")) # The boolean value to indicate whether to use cryptocurrency or forex data
+# Section 2: Define functions to get the online forex data from ccxt API using fetch_ohlcv function and return a DataFrame with 'date', 'high', 'low', 'open', 'close' and 'volume' columns
+def get_forex_data(symbol, start, end):
+    """Get the online forex data from ccxt API using fetch_ohlcv function.
+
+    Args:
+        symbol (str): The symbol of the currency pair.
+        start (str): The start date for the data in YYYY-MM-DD format.
+        end (str): The end date for the data in YYYY-MM-DD format.
+
+    Returns:
+        DataFrame: A DataFrame with 'date', 'high', 'low', 'open', 'close' and 'volume' columns.
+    """
+    # Create an instance of the ccxt exchange class
+    exchange = ccxt.exchange()
+
+    # Convert the start and end dates to milliseconds
+    start_ms = exchange.parse8601(start)
+    end_ms = exchange.parse8601(end)
+
+    # Fetch the OHLCV data for the symbol using fetch_ohlcv function with timeframe='15m' parameter and store it in a list
+    data = exchange.fetch_ohlcv(symbol, timeframe='15m', since=start_ms, limit=end_ms)
+
+    # Convert the list to a dataframe with columns ['date', 'open', 'high', 'low', 'close', 'volume']
+    df = pd.DataFrame(data, columns=['date', 'open', 'high', 'low', 'close', 'volume'])
+
+    # Convert the date column to datetime format
+    df['date'] = pd.to_datetime(df['date'], unit='ms')
+
+    # Return the dataframe
+    return df
+
+# Define a function to get the online cryptocurrency data from Cryptocurrency Data API using download function and return a DataFrame with 'date', 'high', 'low', 'open', 'close' and 'volume' columns
+def get_crypto_data(symbol, start, end):
+    """Get the online cryptocurrency data from Cryptocurrency Data API using download function.
+
+    Args:
+        symbol (str): The symbol of the cryptocurrency.
+        start (str): The start date for the data in YYYY-MM-DD format.
+        end (str): The end date for the data in YYYY-MM-DD format.
+
+    Returns:
+        DataFrame: A DataFrame with 'date', 'high', 'low', 'open', 'close' and 'volume' columns.
+    """
+    # Download the data for the symbol using download function with interval='15m' and group_by='ticker' parameters and store it in a dataframe
+    df = yf.download(symbol, start=start, end=end, interval='15m', group_by='ticker')
+
+    # Reset the index of the dataframe to make 'Date' a column instead of an index
+    df = df.reset_index()
+
+    # Rename the columns to lowercase
+    df.columns = [col.lower() for col in df.columns]
+
+    # Return the dataframe
+    return df
+# Section 3: Check the value of DIGITAL_CURRENCY and get the data accordingly
+if DIGITAL_CURRENCY:
+    # Get the cryptocurrency data for each symbol in DATA_SYMBOLS
+    data_dict = {symbol: get_crypto_data(symbol, start, end) for symbol in DATA_SYMBOLS}
+else:
+    # Get the forex data for each symbol in DATA_SYMBOLS
+    data_dict = {symbol: get_forex_data(symbol, start, end) for symbol in DATA_SYMBOLS}
+# Section 4: Add the technical analysis features to the dataframes using ta library
+for symbol, df in data_dict.items():
+    # Add the trend features using add_trend_ta function
+    df = add_trend_ta(df, high='high', low='low', close='close')
+
+    # Add the volatility features using add_volatility_ta function
+    df = add_volatility_ta(df, high='high', low='low', close='close')
+
+    # Add the momentum features using add_momentum_ta function
+    df = add_momentum_ta(df, high='high', low='low', close='close', volume='volume')
+
+    # Add the others features using add_others_ta function
+    df = add_others_ta(df, close='close')
+
+    # Update the data_dict with the modified dataframe
+    data_dict[symbol] = df
+# Section 5: Define a class for the deep neural network with multiple layers and a function to train and evaluate the model using Adam algorithm and reducing the learning rate
+class DNN(nn.Module):
+    """A class for the deep neural network with multiple layers.
+
+    Attributes:
+        input_size (int): The number of input features.
+        hidden_size (int): The number of hidden units in each layer.
+        output_size (int): The number of output units.
+        dropout (float): The dropout probability.
+        layers (nn.ModuleList): A list of linear layers.
+        activations (nn.ModuleList): A list of activation functions.
+    """
+
+    def __init__(self, input_size, hidden_size, output_size, dropout):
+        """Initialize the DNN class with the given parameters.
+
+        Args:
+            input_size (int): The number of input features.
+            hidden_size (int): The number of hidden units in each layer.
+            output_size (int): The number of output units.
+            dropout (float): The dropout probability.
+        """
+        # Call the parent class constructor
+        super(DNN, self).__init__()
+
+        # Set the attributes
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.output_size = output_size
+        self.dropout = dropout
+
+        # Define the layers as a module list
+        self.layers = nn.ModuleList()
+
+        # Add the first layer from input to hidden
+        self.layers.append(nn.Linear(self.input_size, self.hidden_size))
+
+        # Add the hidden layers with dropout
+        for _ in range(2):
+            self.layers.append(nn.Dropout(self.dropout))
+            self.layers.append(nn.Linear(self.hidden_size, self.hidden_size))
+
+        # Add the output layer from hidden to output
+        self.layers.append(nn.Linear(self.hidden_size, self.output_size))
+
+        # Define the activations as a module list
+        self.activations = nn.ModuleList()
+
+        # Add the ReLU activation for the hidden layers
+        for _ in range(3):
+            self.activations.append(nn.ReLU())
+
+        # Add the Tanh activation for the output layer
+        self.activations.append(nn.Tanh())
+
+    def forward(self, x):
+        """Perform the forward pass of the network.
+
+        Args:
+            x (torch.Tensor): The input tensor of shape (batch_size, input_size).
+
+        Returns:
+            torch.Tensor: The output tensor of shape (batch_size, output_size).
+        """
+        # Loop over the layers and activations
+        for layer, activation in zip(self.layers, self.activations):
+            # Apply the layer and activation function
+            x = activation(layer(x))
+
+        # Return the output
+        return x
+
+def train_and_evaluate_model(model, train_data, test_data, epochs, batch_size, lr, device):
+    """Train and evaluate the model using the given data, parameters and device.
+
+    Args:
+        model (nn.Module): The model to train and evaluate.
+        train_data (DataFrame): The training data with features and target.
+        test_data (DataFrame): The testing data with features and target.
+        epochs (int): The number of epochs to train the model.
+        batch_size (int): The size of each batch of data.
+        lr (float): The learning rate for the optimizer.
+        device (str): The device to use for the model and data. Either 'cpu' or 'cuda'.
+
+    Returns:
+        dict: A dictionary with the following keys and values:
+            - 'model': The trained model.
+            - 'train_loss': The list of training losses per epoch.
+            - 'test_loss': The list of testing losses per epoch.
+            - 'test_mse': The mean squared error on the test data.
+            - 'test_accuracy': The accuracy on the test data.
+            - 'test_precision': The precision on the test data.
+            - 'test_recall': The recall on the test data.
+    """
+    # Move the model to the device
+    model.to(device)
+
+    # Define the loss function as mean squared error
+    criterion = nn.MSELoss()
+
+    # Define the optimizer as Adam with the given learning rate
+    optimizer = Adam(model.parameters(), lr=lr)
+
+    # Define the scheduler as reduce LR on plateau with factor 0.1 and patience 5
+    scheduler = ReduceLROnPlateau(optimizer, factor=0.1, patience=5)
+
+    # Define the number of batches per epoch
+    n_batches = int(np.ceil(len(train_data) / batch_size))
+
+    # Initialize the lists for train and test losses
+    train_loss = []
+    test_loss = []
+
+    # Loop over the epochs
+    for epoch in range(epochs):
+        # Set the model to training mode
+        model.train()
+
+        # Initialize the epoch loss
+        epoch_loss = 0
+
+        # Loop over the batches
+        for i in range(n_batches):
+            # Get the batch data
+            batch_data = train_data[i * batch_size: (i + 1) * batch_size]
+
+            # Separate the features and target
+            features = batch_data.drop('target', axis=1).values
+            target = batch_data['target'].values
+
+            # Convert the features and target to tensors
+            features = torch.tensor(features, dtype=torch.float32, device=device)
+            target = torch.tensor(target, dtype=torch.float32, device=device)
+
+            # Get the model output
+            output = model(features)
+
+            # Calculate the batch loss
+            loss = criterion(output, target)
+
+            # Update the epoch loss
+            epoch_loss += loss.item()
+
+            # Zero the gradients
+            optimizer.zero_grad()
+
+            # Perform the backward pass
+            loss.backward()
+
+            # Update the parameters
+            optimizer.step()
+
+        # Calculate the average epoch loss
+        epoch_loss = epoch_loss / n_batches
+
+        # Append the epoch loss to the train loss list
+        train_loss.append(epoch_loss)
+
+        # Print the epoch and loss
+        print(f"Epoch {epoch + 1}, Loss: {epoch_loss:.4f}")
+
+        # Set the model to evaluation mode
+        model.eval()
+
+        # Get the test features and target
+        test_features = test_data.drop('target', axis=1).values
+        test_target = test_data['target'].values
+
+        # Convert the test features and target to tensors
+        test_features = torch.tensor(test_features, dtype=torch.float32, device=device)
+        test_target = torch.tensor(test_target, dtype=torch.float32, device=device)
+
+        # Get the model output on the test data
+        test_output = model(test_features)
+
+        # Calculate the test loss
+        test_loss_value = criterion(test_output, test_target).item()
+
+        # Append the test loss to the test loss list
+        test_loss.append(test_loss_value)
+
+        # Adjust the learning rate based on the test loss
+        scheduler.step(test_loss_value)
+
+        # Calculate the test mean squared error
+        test_mse = np.mean((test_output.cpu().detach().numpy() - test_target.cpu().detach().numpy()) ** 2)
+
+        # Calculate the test accuracy
+        test_accuracy = np.mean(np.sign(test_output.cpu().detach().numpy()) == np.sign(test_target.cpu().detach().numpy()))
+
+        # Calculate the test precision
+        test_precision = np.sum((np.sign(test_output.cpu().detach().numpy()) == 1) & (np.sign(test_target.cpu().detach().numpy()) == 1)) / np.sum(np.sign(test_output.cpu().detach().numpy()) == 1)
+
+        # Calculate the test recall
+        test_recall = np.sum((np.sign(test_output.cpu().detach().numpy()) == 1) & (np.sign(test_target.cpu().detach().numpy()) == 1)) / np.sum(np.sign(test_target.cpu().detach().numpy()) == 1)
+
+        # Print the test metrics
+        print(f"Test Loss: {test_loss_value:.4f}, Test MSE: {test_mse:.4f}, Test Accuracy: {test_accuracy:.4f}, Test Precision: {test_precision:.4f}, Test Recall: {test_recall:.4f}")
+
+    # Return a dictionary with the model and the metrics
+    return {
+        'model': model,
+        'train_loss': train_loss,
+        'test_loss': test_loss,
+        'test_mse': test_mse,
+        'test_accuracy': test_accuracy,
+        'test_precision': test_precision,
+        'test_recall': test_recall
+    }
+# Section 6: Split the data into train and test sets and train and evaluate the model for each symbol using the metrics of mean squared error, accuracy, precision and recall
+# Define the start and end dates for the train and test sets
+train_start = '2022-01-01'
+train_end = '2022-12-31'
+test_start = '2023-01-01'
+test_end = '2023-04-30'
+
+# Define the number of epochs, batch size and learning rate for the model
+epochs = 50
+batch_size = 64
+lr = 0.01
+
+# Define the input size, hidden size, output size and dropout for the model
+input_size = len(data_dict[DATA_SYMBOLS[0]].columns) - 1 # The number of features
+hidden_size = 64 # The number of hidden units in each layer
+output_size = 1 # The number of output units
+dropout = 0.2 # The dropout probability
+
+# Define the device to use for the model and data
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+# Initialize a dictionary to store the models and the metrics
+model_dict = {}
+
+# Loop over the symbols
+for symbol in DATA_SYMBOLS:
+    # Get the dataframe for the symbol
+    df = data_dict[symbol]
+
+    # Split the dataframe into train and test sets based on the dates
+    train_data = df[(df['date'] >= train_start) & (df['date'] <= train_end)]
+    test_data = df[(df['date'] >= test_start) & (df['date'] <= test_end)]
+
+    # Create an instance of the DNN class with the given parameters
+    model = DNN(input_size, hidden_size, output_size, dropout)
+
+    # Train and evaluate the model using the train and test data, parameters and device
+    result = train_and_evaluate_model(model, train_data, test_data, epochs, batch_size, lr, device)
+
+    # Store the result in the model_dict with the symbol as the key
+    model_dict[symbol] = result
+# Section 7: Create interactive charts using bokeh library and display the actual and predicted data for each symbol
+# Import the required modules from bokeh
+from bokeh.plotting import figure, output_file, show
+from bokeh.models import ColumnDataSource, HoverTool, CrosshairTool
+from bokeh.layouts import gridplot
+
+# Define the output file name for the charts
+output_file("charts.html")
+
+# Initialize a list to store the charts
+charts = []
+
+# Loop over the symbols
+for symbol in DATA_SYMBOLS:
+    # Get the dataframe for the symbol
+    df = data_dict[symbol]
+
+    # Get the test data for the symbol
+    test_data = df[(df['date'] >= test_start) & (df['date'] <= test_end)]
+
+    # Get the model for the symbol
+    model = model_dict[symbol]['model']
+
+    # Get the test features and target
+    test_features = test_data.drop('target', axis=1).values
+    test_target = test_data['target'].values
+
+    # Convert the test features and target to tensors
+    test_features = torch.tensor(test_features, dtype=torch.float32, device=device)
+    test_target = torch.tensor(test_target, dtype=torch.float32, device=device)
+
+    # Get the model output on the test data
+    test_output = model(test_features)
+
+    # Convert the test output to numpy array
+    test_output = test_output.cpu().detach().numpy()
+
+    # Create a column data source from the test data
+    source = ColumnDataSource(test_data)
+
+    # Create a figure for the chart with title, x-axis label, y-axis label and tools
+    p = figure(title=f"{symbol} Actual vs Predicted", x_axis_label='Date', y_axis_label='Target', x_axis_type='datetime', tools='pan,wheel_zoom,box_zoom,reset,save')
+
+    # Add a line glyph for the actual target with legend and color
+    p.line(x='date', y='target', source=source, legend_label='Actual', line_color='blue')
+
+    # Add a line glyph for the predicted target with legend and color
+    p.line(x='date', y='predicted', source=source, legend_label='Predicted', line_color='red')
+
+    # Add a hover tool to show the date, actual and predicted values
+    p.add_tools(HoverTool(tooltips=[('Date', '@date{%F}'), ('Actual', '@target'), ('Predicted', '@predicted')], formatters={'@date': 'datetime'}))
+
+    # Add a crosshair tool to show the vertical and horizontal lines at the cursor position
+    p.add_tools(CrosshairTool())
+
+    # Append the figure to the charts list
+    charts.append(p)
+
+# Create a grid plot from the charts list with three columns
+grid = gridplot(charts, ncols=3)
+
+# Show the grid plot
+show(grid)
+# Section 8: Calculate the sharpe ratio for the strategy based on the model prediction and display it as a table
+# Define a function to calculate the sharpe ratio for a given symbol, model and data
+def calculate_sharpe_ratio(symbol, model, data):
+    """Calculate the sharpe ratio for a given symbol, model and data.
+
+    Args:
+        symbol (str): The symbol of the currency or cryptocurrency pair.
+        model (nn.Module): The trained model for the symbol.
+        data (DataFrame): The data with features and target for the symbol.
+
+    Returns:
+        float: The sharpe ratio for the strategy based on the model prediction.
+    """
+    # Get the features and target from the data
+    features = data.drop('target', axis=1).values
+    target = data['target'].values
+
+    # Convert the features and target to tensors
+    features = torch.tensor(features, dtype=torch.float32, device=device)
+    target = torch.tensor(target, dtype=torch.float32, device=device)
+
+    # Get the model output on the data
+    output = model(features)
+
+    # Convert the output to numpy array
+    output = output.cpu().detach().numpy()
+
+    # Calculate the returns for the strategy based on the model prediction
+    returns = output * target
+
+    # Calculate the mean and standard deviation of the returns
+    mean = np.mean(returns)
+    std = np.std(returns)
+
+    # Calculate the sharpe ratio as the ratio of mean to standard deviation
+    sharpe_ratio = mean / std
+
+    # Return the sharpe ratio
+    return sharpe_ratio
+
+# Initialize a list to store the rows of the table
+rows = []
+
+# Loop over the symbols
+for symbol in DATA_SYMBOLS:
+    # Get the model for the symbol
+    model = model_dict[symbol]['model']
+
+    # Get the data for the symbol
+    data = data_dict[symbol]
+
+    # Calculate the sharpe ratio for the symbol, model and data
+    sharpe_ratio = calculate_sharpe_ratio(symbol, model, data)
+
+    # Append a row to the rows list with the symbol and sharpe ratio
+    rows.append([symbol, sharpe_ratio])
+
+# Create a dataframe from the rows list with columns ['symbol', 'sharpe_ratio']
+df = pd.DataFrame(rows, columns=['symbol', 'sharpe_ratio'])
+
+# Sort the dataframe by sharpe_ratio in descending order
+df = df.sort_values(by='sharpe_ratio', ascending=False)
+
+# Display the dataframe as a table
+display(df)
